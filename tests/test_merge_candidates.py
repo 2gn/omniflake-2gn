@@ -53,6 +53,17 @@ class TestMerge(unittest.TestCase):
         ]
         self.assertEqual(len(merge_candidates.merge([pool])), 1)
 
+    def test_two_spellings_of_one_repository_collapse(self):
+        # GitHub compares owners and repositories without case. A
+        # repository renamed only in case is found again under its new
+        # spelling, and the fresh harvest's spelling is the one kept.
+        old = [{"owner": "ExpressoCodes", "repo": "Nixos-VM", "stars": 17}]
+        new = [{"owner": "ExpressoCodes", "repo": "NixOS-VM", "stars": 17}]
+        self.assertEqual(
+            merge_candidates.merge([old, new]),
+            [{"owner": "ExpressoCodes", "repo": "NixOS-VM", "stars": 17}],
+        )
+
     def test_output_is_sorted_by_repository(self):
         # A canonical order, so a run that changes nothing produces no diff.
         pool = [

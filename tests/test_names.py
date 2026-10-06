@@ -122,6 +122,17 @@ class TestChooseName(unittest.TestCase):
             self.choose("second", "nh", claims={"nh": 1}, used={"nh": 1}), "nh-second"
         )
 
+    def test_a_name_held_under_another_spelling_is_not_another_repository(self):
+        # GitHub compares owners and repositories without case, so
+        # ExpressoCodes/NixOS-VM holding a name is the repository holding it.
+        taken = {"nixos-vm": ("expressocodes", "nixos-vm")}
+        self.assertEqual(
+            self.choose(
+                "ExpressoCodes", "NixOS-VM", claims={"nixos-vm": 1}, taken=taken
+            ),
+            "nixos-vm",
+        )
+
 
 class TestApplyReserved(unittest.TestCase):
     """Tests that names.txt reaches rows nothing else in the run touches,
@@ -210,6 +221,17 @@ class TestCountClaims(unittest.TestCase):
             [self.row("roman", "nixDir")], [], [self.row("roman", "nixDir")]
         )
         self.assertEqual(claims["nixdir"], 1)
+
+    def test_two_spellings_of_one_repository_are_counted_once(self):
+        # The 2026-10-06 failure. The database held ExpressoCodes/NixOS-VM,
+        # a re-checked reject row spelled it Nixos-VM, the two counted as
+        # two claimants, and each was qualified to nixos-vm-expressocodes.
+        claims = resolve.count_claims(
+            [self.row("ExpressoCodes", "NixOS-VM")],
+            [self.row("ExpressoCodes", "Nixos-VM")],
+            [],
+        )
+        self.assertEqual(claims["nixos-vm"], 1)
 
 
 class TestNameMerged(unittest.TestCase):

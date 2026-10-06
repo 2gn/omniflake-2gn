@@ -39,15 +39,19 @@ def read_rows(path):
 def merge(pools):
     """Fold pools of candidate rows into one row per repository.
 
-    The key is the exact (owner, repo) pair, which is what resolve.py keys
-    on too: two spellings of the same repository are two repositories to
-    the whole pipeline, and collapsing them here alone would only move the
-    disagreement.
+    The key is the (owner, repo) pair compared without case, which is
+    resolve.repo_id and how GitHub compares them: ExpressoCodes/Nixos-VM
+    and ExpressoCodes/NixOS-VM are one repository, renamed. Keyed on the
+    exact spelling, both stayed in the pool and resolve.py resolved the
+    repository twice. The later row's spelling is the one kept.
+
+    Lowercased inline rather than imported, because importing resolve
+    reads a GitHub token at import time.
     """
     by_repo = {}
     for pool in pools:
         for row in pool:
-            by_repo[(row["owner"], row["repo"])] = row
+            by_repo[(row["owner"].lower(), row["repo"].lower())] = row
     return [by_repo[key] for key in sorted(by_repo)]
 
 

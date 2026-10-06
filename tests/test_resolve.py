@@ -1,11 +1,14 @@
 """Tests for the reject ledger resolve.py keeps.
 
 Everything under test is a pure function over dicts and lists, so no test
-here issues a GraphQL query or reads a file.
+here issues a GraphQL query. load_rejects is the one exception and reads a
+file, so it gets a temporary one.
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
@@ -99,6 +102,92 @@ class TestSelectCandidates(unittest.TestCase):
         # Even a re-check does not reach them; success is authoritative.
         self.assertNotIn(("b", "known"), self.select(recheck=set(self.REJECTS)))
         self.assertNotIn(("c", "merged"), self.select(recheck=set(self.REJECTS)))
+
+    def test_a_known_repository_spelled_another_way_is_skipped(self):
+        # ExpressoCodes/Nixos-VM was renamed NixOS-VM. The harvest found the
+        # new spelling, the database held the old one, and the repository
+        # was resolved a second time as though it were new.
+        pool = [{"owner": "B", "repo": "Known", "stars": 2}]
+        selected = resolve.select_candidates(
+            pool, self.KNOWN, self.MERGED, self.REJECTS, set()
+        )
+        self.assertEqual(selected, [])
+
+    def test_two_spellings_of_one_new_repository_are_queried_once(self):
+        # Both would resolve, and the database would get two rows for one
+        # repository. The first in star order is the one kept.
+        pool = [
+            {"owner": "a", "repo": "New", "stars": 2},
+            {"owner": "A", "repo": "new", "stars": 1},
+        ]
+        selected = resolve.select_candidates(pool, {}, {}, {}, set())
+        self.assertEqual([(c["owner"], c["repo"]) for c in selected], [("a", "New")])
+
+
+class TestIndexKnown(unittest.TestCase):
+    """Tests how the database is keyed when it is read, over rows that
+    spell one repository two ways. Every pair here is one the database held
+    on 2026-10-05, when GitHub's case-insensitive names had already put nine
+    repositories in it twice."""
+
+    def row(self, owner, repo, name, resolved_at):
+        return {"owner": owner, "repo": repo, "name": name, "resolved_at": resolved_at}
+
+    def test_a_repository_is_keyed_without_case(self):
+        known, _ = resolve.index_known([self.row("NixOS", "nixpkgs", "nixpkgs", 1)])
+        self.assertEqual(list(known), [("nixos", "nixpkgs")])
+
+    def test_two_spellings_of_one_repository_are_one_row(self):
+        known, _ = resolve.index_known(
+            [
+                self.row("unluckytau", "NixOS", "nixos-unluckytau", 2),
+                self.row("unluckytau", "nixos", "nixos-unluckytau", 1),
+            ]
+        )
+        self.assertEqual(len(known), 1)
+
+    def test_the_row_holding_a_bare_name_survives(self):
+        # The second spelling was qualified because the first already held
+        # the bare name, so the bare row is the older assignment even when
+        # it was refreshed less recently. It is also the more useful name.
+        known, _ = resolve.index_known(
+            [
+                self.row(
+                    "KornelJahn", "nixos-disko-zfs-test", "nixos-disko-zfs-test", 1
+                ),
+                self.row(
+                    "korneljahn",
+                    "nixos-disko-zfs-test",
+                    "nixos-disko-zfs-test-korneljahn",
+                    2,
+                ),
+            ]
+        )
+        row = known[("korneljahn", "nixos-disko-zfs-test")]
+        self.assertEqual(row["name"], "nixos-disko-zfs-test")
+        self.assertEqual(row["owner"], "KornelJahn")
+
+    def test_otherwise_the_row_resolved_last_survives(self):
+        # Both spellings qualified to the same name; the newer row has the
+        # newer revision.
+        known, _ = resolve.index_known(
+            [
+                self.row("unluckytau", "nixos", "nixos-unluckytau", 1),
+                self.row("unluckytau", "NixOS", "nixos-unluckytau", 2),
+            ]
+        )
+        self.assertEqual(known[("unluckytau", "nixos")]["repo"], "NixOS")
+
+    def test_the_dropped_row_holds_no_name(self):
+        # A name left in `taken` would block whichever repository the
+        # contention rule hands it to next.
+        _, taken = resolve.index_known(
+            [
+                self.row("ExpressoCodes", "nixstore", "nixstore", 1),
+                self.row("ExpressoCodes", "NixStore", "nixstore-expressocodes", 2),
+            ]
+        )
+        self.assertEqual(taken, {"nixstore": ("expressocodes", "nixstore")})
 
 
 class TestRepoKey(unittest.TestCase):
@@ -258,6 +347,32 @@ class TestPruneRejects(unittest.TestCase):
         rejects = {("c", "three"): 3}
         resolve.prune_rejects(rejects, {}, {})
         self.assertEqual(rejects, {("c", "three"): 3})
+
+
+class TestLoadRejects(unittest.TestCase):
+    """Tests how the ledger is keyed when it is read, over a file holding
+    one repository under two spellings."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        for owner, repo, checked_at in [
+            ("ExpressoCodes", "Nixos-VM", 100),
+            ("expressocodes", "nixos-vm", 200),
+        ]:
+            row = {"owner": owner, "repo": repo, "checked_at": checked_at}
+            self.tmp.write(json.dumps(row) + "\n")
+        self.tmp.close()
+
+    def tearDown(self):
+        os.unlink(self.tmp.name)
+
+    def test_two_spellings_are_one_row_checked_at_the_later_time(self):
+        # The row prune_rejects has to find once ExpressoCodes/NixOS-VM
+        # resolves. Left under its own spelling it was re-checked, resolved,
+        # and given the name the known row already held.
+        self.assertEqual(
+            resolve.load_rejects(self.tmp.name), {("expressocodes", "nixos-vm"): 200}
+        )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,15 @@ repository, and it can add a flake.nix tomorrow. So each run re-checks the
 --recheck-oldest rows checked longest ago, and a row is cleared the moment
 its repository resolves.
 
+A repository is identified by its owner and name compared without case,
+because that is how GitHub compares them. One repository reaches the pool
+under more than one spelling: renamed from Nixos-VM to NixOS-VM, or found
+once as CatgirlAria/nix and once as catgirlaria/nix. Keyed on the exact
+spelling, such a repository became two rows. Each spelling contested the
+other's bare name, both were qualified, and qualified_name lowercases, so
+the two rows claimed one name. Every key here is a repo_id, and a row keeps
+the spelling it was first resolved under.
+
 A bare attribute name is only assigned when one repository claims it.
 4,006 of the names in use are claimed by more than one repository -- 61
 are named home-manager, 110 are named flake -- and a bare name several
@@ -158,6 +167,15 @@ DENY = "-"
 def qualified_name(owner, repo):
     """The name a repository gets when it does not hold the bare one."""
     return f"{sanitize(repo)}-{sanitize(owner)}"
+
+
+def repo_id(owner, repo):
+    """The key a repository is known by, whatever spelling a row carries.
+
+    GitHub is case-insensitive about owners and repositories, so
+    ExpressoCodes/NixOS-VM and ExpressoCodes/Nixos-VM are one repository.
+    """
+    return owner.lower(), repo.lower()
 
 
 # The flake-reference prefixes that still spell a repository as
@@ -316,13 +334,14 @@ def count_claims(*rowsets):
     how a manual.txt entry named "files" landed on the same attribute as an
     indexed flake of that name.
 
-    Rows are folded to distinct (owner, repo) pairs first, because the same
+    Rows are folded to distinct repositories first, because the same
     repository reaches this from more than one set: a known row that is also
-    being refreshed, or an externally resolved row that also has a known row.
+    being refreshed, an externally resolved row that also has a known row,
+    or a candidate spelling a known repository another way.
     """
     pairs = set()
     for rows in rowsets:
-        pairs |= {(row["owner"], row["repo"]) for row in rows}
+        pairs |= {repo_id(row["owner"], row["repo"]) for row in rows}
     return collections.Counter(sanitize(repo) for _, repo in pairs)
 
 
@@ -383,35 +402,82 @@ def choose_name(owner, repo, prior, reserved, claims, taken, used):
 
     # Never take a name another repository already holds, or one this run
     # has already handed out.
-    if taken.get(base) not in (None, (owner, repo)) or used[base]:
+    if taken.get(base) not in (None, repo_id(owner, repo)) or used[base]:
         return qualified
 
     return base
 
 
-def load_known(path):
-    """Read an existing resolved.jsonl into (by_repo, taken_names)."""
-    by_repo, taken = {}, {}
-    if not path:
-        return by_repo, taken
-    try:
-        fh = open(path)
-    except FileNotFoundError:
-        return by_repo, taken
-    with fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            e = json.loads(line)
-            by_repo[(e["owner"], e["repo"])] = e
-            # Remember which repo owns each name so it stays put.
-            taken[e["name"]] = (e["owner"], e["repo"])
+def prefer_row(held, other):
+    """Which of two rows spelling one repository the database keeps.
+
+    The row holding a bare name wins. A bare name is only handed out
+    uncontested, so the second spelling was qualified because the first
+    already held it: the bare row is the older assignment, and the more
+    useful name. Otherwise the row resolved more recently wins, since it has
+    the newer revision. A tie keeps the row already held.
+    """
+
+    def rank(row):
+        bare = row["name"] != qualified_name(row["owner"], row["repo"])
+        return bare, row.get("resolved_at", 0)
+
+    return other if rank(other) > rank(held) else held
+
+
+def index_known(rows):
+    """Key resolved rows by repository: (by_repo, taken_names).
+
+    Rows spelling one repository two ways are folded into one, and each
+    fold is reported, since the row that loses takes an attribute name out
+    of the index. `taken` maps each name to the repository holding it, and
+    is built from the rows that survive so a dropped name holds nothing.
+    """
+    by_repo = {}
+    for row in rows:
+        key = repo_id(row["owner"], row["repo"])
+        held = by_repo.get(key)
+
+        # A second spelling of a repository already read.
+        if held is not None:
+            kept = prefer_row(held, row)
+            dropped = row if kept is held else held
+            print(
+                f"# known: {dropped['owner']}/{dropped['repo']} ({dropped['name']}) "
+                f"folded into {kept['owner']}/{kept['repo']} ({kept['name']})",
+                file=sys.stderr,
+            )
+            row = kept
+        by_repo[key] = row
+
+    # Remember which repo owns each name so it stays put.
+    taken = {row["name"]: key for key, row in by_repo.items()}
     return by_repo, taken
 
 
+def load_known(path):
+    """Read an existing resolved.jsonl into (by_repo, taken_names)."""
+    if not path:
+        return {}, {}
+    try:
+        fh = open(path)
+    except FileNotFoundError:
+        return {}, {}
+    with fh:
+        rows = [
+            json.loads(line)
+            for line in fh
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    return index_known(rows)
+
+
 def load_rejects(path):
-    """Read a rejects.jsonl into {(owner, repo): checked_at}."""
+    """Read a rejects.jsonl into {repo_id: checked_at}.
+
+    Two spellings of one repository are one row, checked at the later of
+    their two times. The ledger is written back under the repo_id spelling.
+    """
     rejects = {}
     if not path:
         return rejects
@@ -425,7 +491,8 @@ def load_rejects(path):
             if not line or line.startswith("#"):
                 continue
             e = json.loads(line)
-            rejects[(e["owner"], e["repo"])] = e.get("checked_at", 0)
+            key = repo_id(e["owner"], e["repo"])
+            rejects[key] = max(rejects.get(key, 0), e.get("checked_at", 0))
     return rejects
 
 
@@ -488,10 +555,8 @@ def select_refresh(known, always, count):
     extra GraphQL batch at most, and a repository whose HEAD did not move
     costs nothing beyond the lookup.
     """
-    pinned = [
-        row for key, row in known.items() if (key[0].lower(), key[1].lower()) in always
-    ]
-    pinned_keys = {(r["owner"], r["repo"]) for r in pinned}
+    pinned_keys = {key for key in known if repo_id(*key) in always}
+    pinned = [row for key, row in known.items() if key in pinned_keys]
 
     # The age window, minus whatever the always set already took, so a
     # pinned row that is also stale is not resolved twice in one run.
@@ -508,15 +573,19 @@ def select_candidates(cands, known, merged, rejects, recheck):
     A repository in the known or merged set is settled and is not asked
     about again here; --refresh-oldest is what brings those round. One
     with a reject row was checked and could not be used, and it stays
-    skipped until its row is in `recheck`.
+    skipped until its row is in `recheck`. A second spelling of a candidate
+    already selected is dropped, so the first in the pool's order is the
+    one resolved.
     """
     out = []
+    seen = set()
     for cand in cands:
-        key = (cand["owner"], cand["repo"])
-        if key in known or key in merged:
+        key = repo_id(cand["owner"], cand["repo"])
+        if key in known or key in merged or key in seen:
             continue
         if key in rejects and key not in recheck:
             continue
+        seen.add(key)
         out.append(cand)
     return out
 
@@ -580,7 +649,7 @@ def main():
             f"displaced {displaced}",
             file=sys.stderr,
         )
-        taken = {e["name"]: (e["owner"], e["repo"]) for e in known.values()}
+        taken = {e["name"]: key for key, e in known.items()}
 
     # Externally resolved rows (tools/manual.py) are authoritative for their
     # repository: the known row, a refresh, and any harvested candidate for
@@ -618,8 +687,8 @@ def main():
         refresh = list(known.values())
     else:
         refresh = select_refresh(known, always, args.refresh_oldest)
-    refresh = [r for r in refresh if (r["owner"], r["repo"]) not in merged]
-    refresh_keys = {(r["owner"], r["repo"]) for r in refresh}
+    refresh = [r for r in refresh if repo_id(r["owner"], r["repo"]) not in merged]
+    refresh_keys = {repo_id(r["owner"], r["repo"]) for r in refresh}
 
     # Every row the run will write, collected rather than streamed: the
     # file is sorted by name at the end, and a sort needs all of it. The
@@ -629,12 +698,11 @@ def main():
 
     # Carry over what is not being refreshed, so the output is always the
     # full database.
-    for entry in known.values():
-        key = (entry["owner"], entry["repo"])
+    for key, entry in known.items():
         if key in refresh_keys or key in merged:
             continue
         out.append(entry)
-    rechecked = sum(1 for c in cands if (c["owner"], c["repo"]) in recheck)
+    rechecked = sum(1 for c in cands if repo_id(c["owner"], c["repo"]) in recheck)
     # How many of the refresh came from always.txt rather than from the age
     # window, so a line that matches no known repository is visible in the
     # log as a count that did not go up.
@@ -680,7 +748,8 @@ def main():
         # which of its repositories are unusable.
         answered = bool(data)
         for j, cand in enumerate(batch):
-            prior = known.get((cand["owner"], cand["repo"]))
+            key = repo_id(cand["owner"], cand["repo"])
+            prior = known.get(key)
             node = data.get(f"r{j}")
             ref = ((node or {}).get("defaultBranchRef") or {}).get("target") or {}
             rev = ref.get("oid")
@@ -695,11 +764,11 @@ def main():
                     # No prior row, so nothing else would remember that this
                     # repository was looked at. Write it down, or the next run
                     # asks about it again.
-                    rejects[(cand["owner"], cand["repo"])] = now
+                    rejects[key] = now
                 continue
 
             # It resolved, so any reject row for it is now wrong.
-            rejects.pop((cand["owner"], cand["repo"]), None)
+            rejects.pop(key, None)
 
             # The lock's root node names the flake's declared direct inputs,
             # and its node count is the size of the transitive graph.
@@ -723,7 +792,7 @@ def main():
             # assignment adds to it; a known row already holds its name.
             if prior is None:
                 used[sanitize(cand["repo"])] += 1
-            taken[name] = (cand["owner"], cand["repo"])
+            taken[name] = key
 
             row = {
                 "name": name,

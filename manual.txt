@@ -12,6 +12,7 @@ AvengeMedia/DankMaterialShell
 b3nj5m1n/xdg-ninja
 dfrankland/envoluntary
 emilien-jegou/oyui
+epireyn/niri-flake
 fzakaria/nix-auto-follow
 fzakaria/nixpkgs-multiverse
 ggml-org/llama.cpp
